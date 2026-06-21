@@ -1,0 +1,40 @@
+# Model weights / checkpoints — never commit (multi-GB)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.onnx
+model.safetensors.index.json
+
+# Build / runtime artifacts
+*.so
+*.o
+*.ptx
+*.cubin
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Logs / results / benchmark output
+*.log
+results/
+*.out
+build-metadata.yaml
+build-metadata.json
+
+# Local env / secrets — never commit
+.env
+.env.local
+*.pem
+*.key
+*_token
+*_TOKEN
+.hf_token
+.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

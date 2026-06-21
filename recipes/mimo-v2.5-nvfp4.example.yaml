@@ -1,0 +1,133 @@
+# =============================================================================
+# MiMo-V2.5-NVFP4 on 2x NVIDIA DGX Spark (GB10, sm_121, ARM aarch64, TP=2)
+# "Config C" — the full optimized deployment.
+#
+#   4-bit nvfp4 KV-cache  +  cudagraph (FULL)  +  WMMA tensor-core decode
+#   +  NCCL_CROSS_NIC multi-rail  +  cudagraph_capture_sizes boot-limit
+#
+# This is an EXAMPLE recipe. It is consumed by a generic launcher that:
+#   1. starts the container on each node,
+#   2. applies the `mods/` (each is a directory with a run.sh that patches the
+#      installed vLLM site-packages — see the Dockerfile, which bakes them in),
+#   3. runs the `command` below.
+#
+# All placeholders are written as <UPPER_CASE>. Replace them for your cluster.
+# Nothing here contains real IPs, hostnames, paths, tokens or keys.
+# =============================================================================
+
+recipe_version: "1"
+name: MiMo-V2.5-NVFP4-ConfigC
+description: >
+  MiMo-V2.5-NVFP4 (Xiaomi, ~310B MoE / ~15B active) on 2x DGX Spark, TP=2.
+  4-bit nvfp4 KV-cache + FULL cudagraph + WMMA tensor-core flash-decode +
+  NCCL_CROSS_NIC multi-rail. Single-stream ~44 tok/s, aggregate ~418 tok/s @C=24,
+  KV pool ~470K tokens (2x vs fp8).
+
+# HuggingFace model id (NVFP4 checkpoint).
+model: lukealonso/MiMo-V2.5-NVFP4
+container: vllm-node-mimo-v25-nvfp4
+
+# This recipe requires both nodes (TP=2 spans the two GB10s over RoCE).
+cluster_only: true
+solo_only: false
+
+# vLLM PR #41797 (TRITON_ATTN_DIFFKV sinks without FA3) is required on sm_121,
+# which only has FlashAttention-2. The fix-mimo-v2-vllm mod also applies it.
+build_args:
+  - --apply-vllm-pr
+  - "41797"
+
+# Mods are applied in order. Each is a directory containing a run.sh that patches
+# the installed vLLM. See mods/*/run.sh — they are baked into the image by the
+# Dockerfile, so at runtime the mods are already present.
+mods:
+  - mods/fix-mimo-v2-vllm          # MiMo-V2.5 enablement: chat template, MTP,
+                                    #   tool/reasoning parser, DiffKV quant-KV gate
+  - mods/fix-modelopt-mixed-mxfp8  # ModelOpt MIXED_PRECISION MXFP8 dispatch fix
+  - mods/nvfp4-kv-diffkv           # 4-bit nvfp4 KV store/decode + WMMA kernel
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: MiMo-V2.5-NVFP4
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  # 0.87 fits a 256K KV budget on 2x GB10 without a reboot. This is hardware
+  # specific (unified memory; the model rests at ~2.4 GiB free at 0.87).
+  # util < 0.86 yields negative KV (model + activations exceed the reservation).
+  gpu_memory_utilization: 0.87
+  max_model_len: 98304             # 96K — fits long-context tests (e.g. 71K prompt)
+  max_num_batched_tokens: 16384
+  max_num_seqs: 6                  # raise (e.g. 24) for the aggregate-throughput sweet spot
+
+env:
+  MIMO_DEFAULT_THINKING_TOKEN_BUDGET: "4096"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TORCH_CUDA_ARCH_LIST: "12.1a"    # GB10 = sm_121a
+
+  # --- THE comm hammer: multi-rail NCCL over 2 RoCE NICs = +42% single-stream,
+  #     +83% @C=8. Single-stream decode on TP=2 is latency/comm-bound, not
+  #     weight-bandwidth-bound, so this is the single biggest speed lever.
+  NCCL_CROSS_NIC: "1"
+  RAY_memory_monitor_refresh_ms: "0"   # disable Ray false-OOM monitor (unified mem)
+
+  # Ray executor knobs — keep V2/DAG-overlap OFF on >=100GB models (extra mem).
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+
+  # NCCL tuning for the GB10 RoCE fabric.
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_NTHREADS: "8"
+  NCCL_NSOCKS_PERTHREAD: "2"
+  NCCL_BUFFSIZE: "8388608"
+
+  # FlashInfer NVFP4 MoE backend (sm12x cutlass kernel).
+  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_USE_FLASHINFER_MOE_FP4: "1"
+  VLLM_FLASHINFER_MOE_BACKEND: throughput
+
+  # nvfp4 KV-cache: inline dequant in the fused attention kernel.
+  VLLM_NVFP4_INLINE: "1"
+
+  # WMMA tensor-core flash-decode for nvfp4 KV (FULL-attention decode only;
+  # SWA/prefill fall back to Triton). +21% long-context decode, cudagraph-safe.
+  # Set to "0" to disable (Triton fallback everywhere).
+  VLLM_WMMA_DECODE: "1"
+  VLLM_WMMA_INSPECT: "0"
+  VLLM_WMMA_COMPARE: "0"
+  VLLM_WMMA_AUTHCOMPARE: "0"
+
+# NOTE: <MODEL_SNAPSHOT_PATH> is the local HF snapshot directory for the model,
+# e.g. $HOME/.cache/huggingface/hub/models--lukealonso--MiMo-V2.5-NVFP4/snapshots/<HASH>
+command: |
+  vllm serve <MODEL_SNAPSHOT_PATH> \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --dtype auto \
+      --kv-cache-dtype nvfp4 \
+      --block-size 32 \
+      --attention-backend triton_attn_diffkv \
+      --compilation-config '{{"cudagraph_capture_sizes":[1,2,4,8]}}' \
+      --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+      --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --distributed-executor-backend ray \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+      --no-async-scheduling \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --load-format instanttensor \
+      --enable-auto-tool-choice \
+      --tool-call-parser mimo \
+      --reasoning-parser mimo \
+      --chat-template /root/mimo_chat_template.jinja

@@ -190,14 +190,23 @@ All on 2x DGX Spark (GB10), MiMo-V2.5-NVFP4, TP=2, MTP-2, the deployment config
 
 ### Throughput (tok/s)
 
-| Streams (C) | tok/s (aggregate) |
+| Streams (C) | tok/s (aggregate), `max_num_seqs=32` |
 |------------:|------------------:|
-| 1           | ~39–44            |
-| 4           | ~67               |
-| 8           | ~145–209          |
-| 16          | ~306              |
-| **24**      | **~418** (peak)   |
-| 32          | ~308 (mns-limited)|
+| 1           | ~43–44            |
+| 6           | ~112              |
+| 16          | ~268              |
+| 24          | ~402              |
+| **32**      | **~493**          |
+
+**`max_num_seqs` is the multi-stream dial.** The default (6) caps aggregate
+throughput at ~112 tok/s — every stream past 6 just queues. Raising it to 32
+unlocks near-linear scaling to **~493 tok/s** (≈ 4.4x, ~15 tok/s/stream sustained).
+The **4-bit KV-cache is what makes this affordable** (the pool is still ~372K
+tokens at `max_num_seqs=32`). Trade-off: more concurrent slots = less *guaranteed*
+KV per stream — so it's a regime choice, **max-KV-per-request (low mns, long
+single contexts)** vs **max-aggregate (high mns)**. Set it via `MAX_NUM_SEQS`
+(see [QUICKSTART.md](QUICKSTART.md)). Streams ≤6 are MoE-arithmetic-limited
+(small-batch expert under-utilization), not mns-limited.
 
 Single-stream decode tok/s is **content-dependent** via MTP acceptance: structured
 output (lists/code echo) ~34 tok/s @89% accept, factual ~25 @55%, creative prose
@@ -249,6 +258,21 @@ hard-code MiMo shapes (K192/V128, G=16, block_size 32/64) and JIT-compile for
 - **Custom MoE / scalar-CUDA attention kernels** — could not beat the existing
   tensor-core paths; a true max attention kernel needs hand-`mma.sync` PTX
   (multi-week effort).
+- **Expert Parallelism (`--enable-expert-parallel`, EP=2)** — measured *worse* on
+  this 2-node setup: single-stream 36 vs 43 (the all-to-all dispatch adds overhead
+  with only 2 ranks). The literature's "EP helps" applies to DP=8+EP at ≥512
+  concurrent requests, not 2 Sparks. **Plain TP=2 stays the winner here.** (The
+  real multi-stream lever is `max_num_seqs`, above — not EP.)
+- **`lm_head` → MXFP8** — unlike `o_proj`, vLLM's `ParallelLMHead` does not declare
+  a `weight_scale_inv` parameter, and routing it through the MXFP8 LinearMethod via
+  `get_quant_method` alone is **not** sufficient (the weight-creation path still
+  fails at load). A full fix needs a deeper `ParallelLMHead.weight_loader` /
+  `create_weights` override. So the selective re-quant ships as **`o_proj`-only**
+  (the `tools/` script supports `--lmhead-format skip`).
+- **NCCL_NTHREADS / inductor fusion passes / async-scheduling** — `NCCL_NTHREADS`
+  was within noise; the `fuse_act_quant`/`fuse_norm_quant` passes gave 0% on
+  `sm_121` (pattern-match miss) at a memory cost; `--async-scheduling` is
+  incompatible with the Ray multi-node executor.
 - **NCCL_NTHREADS / fusion passes / mnbt / block-size** — no reproducible gain.
 - **SWA fp8 / full nvfp4 KV hybrid** — vLLM uses a uniform page size; the
   nvfp4:fp8 ratio (1.777) is never integral, so padding eats the capacity.

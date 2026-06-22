@@ -65,6 +65,7 @@ the single-node (solo) variant, tunables, and troubleshooting.
 | c | **`NCCL_CROSS_NIC` multi-rail** over the 2 RoCE NICs | **+42%** single-stream, **+83%** @C=8 — the single biggest speed lever |
 | d | **`cudagraph_capture_sizes` boot limit** `[1,2,4,8]` | **~7x faster boot** (≈28 min → ~4 min), applies to every restart |
 | e | **`o_proj` → MXFP8** selective re-quant | **+8.5% KV** (quality held); **no** speed change |
+| f | **`lm_head` → NVFP4 (W4A16)** Marlin weight-only FP4 | **+27% tok/s on tool/code** (~49 tok/s), quality-neutral (56/79); +2% KV |
 
 **The empirical lesson:** single-stream decode on TP=2 here is **latency /
 communication-bound**, *not* weight-bandwidth-bound. That is why `NCCL_CROSS_NIC`
@@ -178,8 +179,36 @@ MiMo keeps `o_proj`/`lm_head` in BF16. Re-quantizing per-layer `o_proj` to MXFP8
 (calibration-free, same format the checkpoint already uses for `qkv`) frees ~1.6 GB
 → **+8.5% KV** (434K vs 400K), quality held. It gives **+0% tok/s** — confirming
 the latency/comm-bound finding. Tooling:
-[`tools/quantize_oproj_mxfp8.py`](tools/quantize_oproj_mxfp8.py) (lm_head path is
-experimental — it needs a separate `ParallelLMHead` vLLM patch, not included).
+[`tools/quantize_oproj_mxfp8.py`](tools/quantize_oproj_mxfp8.py).
+
+### (f) `lm_head` → NVFP4 (W4A16)  →  +27% tok/s on tool/code, quality-neutral
+
+MiMo's `lm_head` (BF16, `[152576, 4096]`, ~1.25 GB) is read ~3x per decode step
+(once for the main verify + twice for the MTP drafter). Quantizing it to **NVFP4
+W4A16** (4-bit weights, BF16 activations, Marlin weight-only FP4 GEMM — a *true*
+4-bit read, not dequant-to-BF16 emulation) cuts that traffic ~4x. Standalone the
+lm_head GEMM is ~5x faster at decode batch; end-to-end:
+
+| regime | bf16 lm_head | **nvfp4 lm_head** | Δ |
+|--------|-------------:|------------------:|---|
+| echo (code/tool reproduction) | 38.8 | **49.3** | **+27%** (step 71→57 ms) |
+| novel (control) | 44.1 | 46.9 | +6% |
+| diverse (prose) | 36.4 | 35.8 | ~wash |
+
+The win lands on **tool/code-heavy** decode; pure prose is ~neutral because the
+MTP drafter now also uses the quantized head, slightly lowering its acceptance
+and offsetting the step-time gain. **Quality is neutral**: reliability-bench
+**56/79 = identical to the bf16 baseline**, with the KV/recall-sensitive tasks
+(existence 24/24, refusal-to-fabricate 9/9) perfect. Plus ~+2% KV. lm_head is the
+most logit-sensitive layer, so this was verified, not assumed.
+
+Implementation ([`mods/fix-lmhead-nvfp4`](mods/fix-lmhead-nvfp4),
+[`tools/quantize_lmhead_nvfp4.py`](tools/quantize_lmhead_nvfp4.py)) needed six
+vLLM-wiring fixes: `get_quant_method` routing for `ParallelLMHead`; leaf-match for
+the Omni `language_model.lm_head` prefix; a *filtered* checkpoint shard so the
+BF16 head isn't double-loaded over the packed one; `weight_scale_2` shape `[1]`;
+`params_dtype` on the embedding (Marlin reads it); and the MTP drafter head
+getting its own `quant_config`.
 
 ---
 
@@ -263,12 +292,11 @@ hard-code MiMo shapes (K192/V128, G=16, block_size 32/64) and JIT-compile for
   with only 2 ranks). The literature's "EP helps" applies to DP=8+EP at ≥512
   concurrent requests, not 2 Sparks. **Plain TP=2 stays the winner here.** (The
   real multi-stream lever is `max_num_seqs`, above — not EP.)
-- **`lm_head` → MXFP8** — unlike `o_proj`, vLLM's `ParallelLMHead` does not declare
-  a `weight_scale_inv` parameter, and routing it through the MXFP8 LinearMethod via
-  `get_quant_method` alone is **not** sufficient (the weight-creation path still
-  fails at load). A full fix needs a deeper `ParallelLMHead.weight_loader` /
-  `create_weights` override. So the selective re-quant ships as **`o_proj`-only**
-  (the `tools/` script supports `--lmhead-format skip`).
+- **`lm_head` → MXFP8** — superseded. The lm_head is now quantized to **NVFP4
+  W4A16** instead (a true 4-bit-weight Marlin GEMM, which MXFP8 emulation could
+  not deliver speed-wise). It is a **win, not a limitation** — see contribution
+  (f) above (+27% tok/s on tool/code, quality-neutral 56/79). The MXFP8 route was
+  abandoned (NVFP4 won).
 - **NCCL_NTHREADS / inductor fusion passes / async-scheduling** — `NCCL_NTHREADS`
   was within noise; the `fuse_act_quant`/`fuse_norm_quant` passes gave 0% on
   `sm_121` (pattern-match miss) at a memory cost; `--async-scheduling` is
@@ -301,17 +329,20 @@ fixes here all failed or produced garbage on GB10.
 │   │                                      #   MTP, tool/reasoning parser, PR #41797,
 │   │                                      #   DiffKV quant-KV gate)
 │   ├── fix-modelopt-mixed-mxfp8/          # ModelOpt MIXED_PRECISION MXFP8 dispatch
-│   └── nvfp4-kv-diffkv/                    # 4-bit nvfp4 KV store/decode + WMMA kernel
-│       ├── run.sh
-│       ├── triton_attn_diffkv.py          # DiffKV backend + capturable nvfp4 store
-│       ├── triton_unified_attention_diffkv.py  # inline nvfp4 dequant fused attn
-│       └── wmma_decode.py                  # WMMA tensor-core flash-decode kernel
+│   ├── nvfp4-kv-diffkv/                    # 4-bit nvfp4 KV store/decode + WMMA kernel
+│   │   ├── run.sh
+│   │   ├── triton_attn_diffkv.py          # DiffKV backend + capturable nvfp4 store
+│   │   ├── triton_unified_attention_diffkv.py  # inline nvfp4 dequant fused attn
+│   │   └── wmma_decode.py                  # WMMA tensor-core flash-decode kernel
+│   └── fix-lmhead-nvfp4/                   # lm_head → NVFP4 W4A16: get_quant_method
+│       └── run.sh                          #   routing + params_dtype + MTP-drafter patch
 ├── recipes/
 │   └── mimo-v2.5-nvfp4.example.yaml        # Config C launch recipe (placeholders)
 ├── docs/
 │   └── MULTI_NODE_SETUP.md                 # 2-node Ray + RoCE/NCCL setup guide
 └── tools/
     ├── quantize_oproj_mxfp8.py             # selective o_proj→MXFP8 re-quant (CPU)
+    ├── quantize_lmhead_nvfp4.py            # lm_head → NVFP4 W4A16 overlay (CPU)
     └── README.md
 ```
 

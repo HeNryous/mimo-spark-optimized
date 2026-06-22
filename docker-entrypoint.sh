@@ -48,6 +48,12 @@
 #                    simple). When on, the entrypoint generates the overlay with
 #                    tools/quantize_oproj_mxfp8.py and serves the merged model.
 #
+#   ENABLE_LMHEAD_NVFP4  "1" to opt in to the lm_head->NVFP4 (W4A16) overlay
+#                    (+~27% tok/s on tool/code decode, quality-neutral 56/79,
+#                    +~2% KV). Default OFF. Generates the overlay with
+#                    tools/quantize_lmhead_nvfp4.py (needs the fix-lmhead-nvfp4
+#                    mod, baked in the image) and serves the merged model.
+#
 #   EXTRA_VLLM_ARGS  appended verbatim to the `vllm serve` command (escape hatch).
 #   SKIP_DOWNLOAD    "1" to skip the auto-download pre-check (model is present).
 #
@@ -79,6 +85,7 @@ export HF_HOME
 
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-/root/mimo_chat_template.jinja}"
 ENABLE_OPROJ_MXFP8="${ENABLE_OPROJ_MXFP8:-0}"
+ENABLE_LMHEAD_NVFP4="${ENABLE_LMHEAD_NVFP4:-0}"
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 
@@ -211,6 +218,25 @@ maybe_build_oproj_overlay() {
     log "Serving o_proj->MXFP8 overlay: $RESOLVED_MODEL"
 }
 
+# Optional lm_head -> NVFP4 (W4A16) overlay (opt-in; default OFF). Re-quantizes
+# lm_head to 4-bit (Marlin weight-only FP4) for ~+27% tok/s on tool/code decode
+# (quality-neutral, 56/79); requires the fix-lmhead-nvfp4 mod (baked in the image).
+# ---------------------------------------------------------------------------
+maybe_build_lmhead_overlay() {
+    [[ "$ENABLE_LMHEAD_NVFP4" == "1" ]] || return 0
+    local out="${LMHEAD_OUT_DIR:-$HF_HOME/mimo-lmhead-nvfp4-overlay}"
+    if [[ -f "$out/config.json" ]]; then
+        log "lm_head->NVFP4 overlay already present at $out — reusing."
+    else
+        log "ENABLE_LMHEAD_NVFP4=1 — generating lm_head->NVFP4 W4A16 overlay (CPU) into $out ..."
+        python3 /opt/mimo/tools/quantize_lmhead_nvfp4.py \
+            --snap "$RESOLVED_MODEL" --out "$out" \
+            || die "lm_head->NVFP4 overlay generation failed."
+    fi
+    RESOLVED_MODEL="$out"
+    log "Serving lm_head->NVFP4 overlay: $RESOLVED_MODEL"
+}
+
 # ---------------------------------------------------------------------------
 # Assemble the Config-C `vllm serve` argument list (head/solo only).
 # ---------------------------------------------------------------------------
@@ -294,6 +320,7 @@ PY
 
     resolve_model_path
     maybe_build_oproj_overlay
+    maybe_build_lmhead_overlay
     build_vllm_cmd
     log "Launching vLLM (head / rank 0):"
     log "  vllm ${VLLM_ARGS[*]}"
@@ -328,6 +355,7 @@ run_solo() {
     log "Solo mode: single-node, no Ray (TP_SIZE=$TP_SIZE)."
     resolve_model_path
     maybe_build_oproj_overlay
+    maybe_build_lmhead_overlay
     build_vllm_cmd
     log "Launching vLLM (solo):"
     log "  vllm ${VLLM_ARGS[*]}"

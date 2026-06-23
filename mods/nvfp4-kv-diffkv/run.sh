@@ -6,6 +6,12 @@ echo "[nvfp4-kv-diffkv] installing nvfp4 DiffKV store+decode backend"
 cp "$HERE/triton_attn_diffkv.py" "$SITE/vllm/v1/attention/backends/triton_attn_diffkv.py"
 cp "$HERE/triton_unified_attention_diffkv.py" "$SITE/vllm/v1/attention/ops/triton_unified_attention_diffkv.py"
 cp "$HERE/wmma_decode.py" "$SITE/vllm/v1/attention/ops/wmma_decode.py"
+# ThunderKittens decode kernel (split-K + MTP-fusion, ~2.6x over WMMA on MTP path)
+rm -rf /tmp/tkinc && mkdir -p /tmp/tkinc
+cp -r "$HERE/tk-decode/include"   /tmp/tkinc/include
+cp -r "$HERE/tk-decode/prototype" /tmp/tkinc/prototype
+cp "$HERE/tk-decode/tk_decode.py" "$SITE/vllm/v1/attention/ops/tk_decode.py"
+echo "[tk-decode] installed (VLLM_TK_DECODE=${VLLM_TK_DECODE:-0})"
 python3 -c "import ast; ast.parse(open('$SITE/vllm/v1/attention/backends/triton_attn_diffkv.py').read()); print('[nvfp4-kv-diffkv] backend syntax OK')"
 python3 - <<'PYEOF'
 import pathlib

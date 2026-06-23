@@ -431,3 +431,11 @@ if _os.environ.get("VLLM_WMMA_DECODE", "1") != "0":
             logger.warning("[wmma_decode] pre-compile returned False (kernel disabled)")
     except Exception as _wmma_pe:
         logger.warning("[wmma_decode] pre-compile failed: %s", _wmma_pe)
+    try:
+        import os as _os_tk
+        if _os_tk.environ.get("VLLM_TK_DECODE","0")=="1":
+            from vllm.v1.attention.ops.tk_decode import _compile as _tk_precompile
+            logger.info("[tk_decode] pre-compiled TK decode kernel at startup" if _tk_precompile()
+                        else "[tk_decode] pre-compile returned False (TK disabled, WMMA fallback)")
+    except Exception as _tk_pe:
+        logger.warning("[tk_decode] pre-compile failed: %s", _tk_pe)

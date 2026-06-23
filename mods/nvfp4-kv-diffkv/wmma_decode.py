@@ -234,6 +234,15 @@ def try_wmma_decode(q, k_cache, out, seqused_k, block_table, softmax_scale,
     unchanged; only the work-item batch is expanded (validated q_len=3, rel-err ~quant-noise).
     """
     global _DBG
+    if os.environ.get("VLLM_TK_DECODE", "0") == "1":
+        try:
+            from vllm.v1.attention.ops import tk_decode as _tk
+            if _tk.try_wmma_decode(q, k_cache, out, seqused_k, block_table, softmax_scale,
+                    num_kv_heads, head_size_qk, head_size_v, block_size, sinks, softcap,
+                    window_left, cu_seqlens_q, max_seqlen_q, force):
+                return True
+        except Exception:
+            pass   # any TK failure -> safe WMMA fallback below
     def _dbg(reason):
         global _DBG
         if _DBG < 12:

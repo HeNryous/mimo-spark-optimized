@@ -1,0 +1,94 @@
+# TEST RECIPE (MoE throughput backend test (A/B twin) (vs throughput).
+# Identical to ...-test-mnbt8k.yaml EXCEPT max_num_batched_tokens 8192 -> 16384.
+# Hypothesis: fewer prefill chunks (long prompts split into ~2x16K instead of
+# ~4x8K) -> better GPU utilization in prefill -> lower TTFT on the 44:1
+# prefill-bound workload. Reuses existing image (no rebuild).
+
+recipe_version: "1"
+name: MiMo-V2.5-NVFP4-Prod-TP-best6
+description: >
+  MoE throughput backend test (A/B twin) (vs throughput).
+
+model: /root/.cache/huggingface/MiMo-lmhead-nvfp4
+container: vllm-node-mimo-v25-nvfp4
+cluster_only: true
+solo_only: false
+
+build_args:
+  - --apply-vllm-pr
+  - "41797"
+
+mods:
+  - mods/drop-caches
+  - mods/fix-mimo-v2-vllm
+  - mods/fix-modelopt-mixed-mxfp8
+  - mods/nvfp4-kv-diffkv
+  - mods/fix-lmhead-nvfp4
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  served_model_name: MiMo-V2.5-NVFP4
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.87
+  max_model_len: 163840
+  max_num_batched_tokens: 16384
+  max_num_seqs: 8
+
+
+env:
+  MIMO_DEFAULT_THINKING_TOKEN_BUDGET: "4096"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TORCH_CUDA_ARCH_LIST: "12.1a"
+  NCCL_CROSS_NIC: "1"
+  RAY_memory_monitor_refresh_ms: "0"
+  VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
+  VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_NTHREADS: "8"
+  NCCL_NSOCKS_PERTHREAD: "2"
+  NCCL_BUFFSIZE: "8388608"
+  VLLM_NVFP4_GEMM_BACKEND: flashinfer-cutlass
+  VLLM_USE_FLASHINFER_MOE_FP4: "1"
+  VLLM_FLASHINFER_MOE_BACKEND: throughput
+  VLLM_NVFP4_INLINE: "1"
+  VLLM_WMMA_DECODE: "1"
+  VLLM_TK_DECODE: "1"
+  TK_INC: "/opt/tkinc"
+  VLLM_WMMA_INSPECT: "0"
+  VLLM_WMMA_COMPARE: "0"
+  VLLM_WMMA_AUTHCOMPARE: "0"
+
+command: |
+  vllm serve /root/.cache/huggingface/MiMo-lmhead-nvfp4 \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --dtype auto \
+      --kv-cache-dtype nvfp4 \
+      --block-size 32 \
+      --attention-backend triton_attn_diffkv \
+      --compilation-config '{{"cudagraph_capture_sizes":[1,2,4,6,8,12,16,24]}}' \
+      --hf-overrides '{{"architectures":["MiMoV2OmniForCausalLM"]}}' \
+      --limit-mm-per-prompt '{{"image":4,"video":1,"audio":1}}' \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --pipeline-parallel-size {pipeline_parallel} \
+      --distributed-executor-backend ray \
+      --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
+      --no-async-scheduling \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --load-format instanttensor \
+      --enable-auto-tool-choice \
+      --tool-call-parser mimo \
+      --reasoning-parser mimo \
+      --chat-template /root/mimo_chat_template.jinja

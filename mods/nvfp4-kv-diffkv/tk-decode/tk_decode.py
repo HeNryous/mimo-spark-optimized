@@ -7,7 +7,7 @@ _HK,_HV,_SB,_G = 192,128,180,16
 _QLEN_CAP=3
 _NSTRIDE=256
 _MAX_BATCH=max(1,int(os.environ.get("VLLM_TK_MAX_BATCH","64")))
-def _nsplit(num_seqs): return max(32, min(_NSTRIDE, 256//max(1,num_seqs)))
+def _nsplit(num_seqs): return max(32, min(96, 256//max(1,num_seqs)))   # 96 = 1-wave (192 blk @ 4/SM x 48 SM); NS256 wasted ~2.7 waves
 
 _CUDA_SRC=r'''
 #include "kittens.cuh"

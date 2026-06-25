@@ -385,3 +385,46 @@ foundations below, which deserve the credit for making it possible.
 
 MIT — see [LICENSE](LICENSE). Provided as-is; the kernels are research-grade and
 specific to this hardware.
+
+## Update 2026-06 — NSPLIT 1-wave tuning + async scheduling unlock
+
+Two further **lossless** wins on top of the table above, both validated live on 2× GB10 (TP=2, Ray, MiMo-V2.5-NVFP4 + MTP2):
+
+### (g) NSPLIT 1-wave tuning  →  +7–15% decode attention, bit-exact
+
+The TK decode kernel's split-K count is capped so total blocks land on **one full GPU wave**
+— `num_kv_heads × NSPLIT × num_seqs ≈ 192` (4 blocks/SM × 48 SMs) — instead of the previous
+~2.7 waves (NSPLIT=256 → 512 blocks → wave-quantization waste). One-line change in
+`tk_decode.py` (`_nsplit` cap `256→96`). Isolated kernel: **+7–15% at 32K–100K** context,
+rel-err ~5e-3 (bf16 reduction reorder, no systematic error). End-to-end it is marginal because
+decode is MoE-dominated, but it is free and bit-stable.
+
+### (h) async scheduling for MTP on Ray  →  lossless +6–8% tok/s  (`mods/enable-async-mtp/`)
+
+vLLM disables async scheduling for MTP speculative decoding — but this is a conservative
+oversight, **not** a technical limitation:
+
+* The Ray distributed executor already implements async execution
+  (`execute_model(non_block=True) → FutureWrapper`, `max_concurrent_batches=2`) but never
+  overrides `supports_async_scheduling()` (inherits the base `False`).
+* `vllm/config/vllm.py` exempts `"draft_model"` from the async-disable gates but **forgets
+  `"mtp"`** — even though the hard-fail error message itself lists *"EAGLE/MTP/Draft
+  Model/NGram"* as supported.
+
+The mod patches both (Ray flag + the two `mtp` exemptions); launch with `--async-scheduling`.
+Async is lossless by construction (identical tokens; it only overlaps CPU scheduling with GPU
+execution). On a GPU-bound decode (~90% util) it recovers the CPU-scheduling gap:
+
+| context | before | async |
+|---|---|---|
+| short, single-stream | 36.7 tok/s | **39.2** (+7%) |
+| 64K decode | 9.8 | **10.6** (+8%) |
+| 100K decode | 8.3 | **8.8** (+6%) |
+
+Quality unchanged (needle recall = dense baseline). This is the highest-leverage item for
+anyone running MiMo (or any MTP model) multi-node on Ray.
+
+> Tried and rejected (documented for honesty): KV-sparsity (Quest-style) — block-level
+> criticality is too loose at head_dim 192 to preserve mid-context needle recall; a custom
+> TK **prefill** kernel — correct but ~11–16% slower than the already tensor-core-efficient
+> Triton prefill (decode is GEMV where Triton is weak, prefill is GEMM where it is not).

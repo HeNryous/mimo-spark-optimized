@@ -1,5 +1,11 @@
 # MiMo-V2.5-NVFP4 on 2x NVIDIA DGX Spark — optimized vLLM build
 
+> **Note on the prebuilt image:** `ghcr.io/henryous/mimo-spark-optimized:v1.0` (and `:latest`)
+> are pinned to the v1.0 content (TK decode kernel). The **NS96 tuning** and **async-MTP unlock**
+> below are in the source only — `docker pull` does *not* rebuild. **Build from this repo**
+> (`docker build`) to get the latest optimizations baked in.
+
+
 Running **MiMo-V2.5** (Xiaomi, ~310B-parameter Mixture-of-Experts, ~15B active,
 NVFP4 weights) on **two NVIDIA DGX Spark** (GB10, `sm_121`, ARM aarch64) with
 tensor parallelism (TP=2) over RoCE — and a set of custom kernels and config
